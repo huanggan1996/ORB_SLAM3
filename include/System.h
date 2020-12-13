@@ -21,8 +21,9 @@
 #define SYSTEM_H
 
 //#define SAVE_TIMES
-
+#ifndef _WINDOWS
 #include <unistd.h>
+#endif
 #include<stdio.h>
 #include<stdlib.h>
 #include<string>
@@ -40,6 +41,9 @@
 #include "Viewer.h"
 #include "ImuTypes.h"
 
+#ifdef _WINDOWS
+void usleep(unsigned long usec);
+#endif
 
 namespace ORB_SLAM3
 {
@@ -78,7 +82,13 @@ class Tracking;
 class LocalMapping;
 class LoopClosing;
 
-class System
+#ifdef ORB_SLAM3_EXPORTS
+#define DLL_API __declspec(dllexport)
+#else
+#define DLL_API __declspec(dllimport)
+#endif
+
+class DLL_API System
 {
 public:
     // Input sensor
