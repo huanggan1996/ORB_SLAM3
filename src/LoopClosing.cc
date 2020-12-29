@@ -38,29 +38,34 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mbStopGBA(false), mpThreadGBA(NULL), mbFixScale(bFixScale), mnFullBAIdx(0), mnLoopNumCoincidences(0), mnMergeNumCoincidences(0),
     mbLoopDetected(false), mbMergeDetected(false), mnLoopNumNotFound(0), mnMergeNumNotFound(0)
 {
+    // 连续性阈值
     mnCovisibilityConsistencyTh = 3;
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
 }
 
+// 设置追踪线程句柄
 void LoopClosing::SetTracker(Tracking *pTracker)
 {
     mpTracker=pTracker;
 }
-
+// 设置局部建图线程的句柄
 void LoopClosing::SetLocalMapper(LocalMapping *pLocalMapper)
 {
     mpLocalMapper=pLocalMapper;
 }
 
-
+// 回环线程主函数
 void LoopClosing::Run()
 {
     mbFinished =false;
 
+    // 线程主循环
     while(1)
     {
-        //NEW LOOP AND MERGE DETECTION ALGORITHM
-        //----------------------------
+        // Check if there are keyframes in the queue
+        // Loopclosing中的关键帧是LocalMapping发送过来的，LocalMapping是Tracking中发过来的
+        // 在LocalMapping中通过 InsertKeyFrame 将关键帧插入闭环检测队列mlpLoopKeyFrameQueue
+        // Step 1 查看闭环检测队列mlpLoopKeyFrameQueue中有没有关键帧进来
         if(CheckNewKeyFrames())
         {
             if(mpLastCurrentKF)
@@ -222,9 +227,10 @@ void LoopClosing::Run()
             }
             mpLastCurrentKF = mpCurrentKF;
         }
-
+		// 查看是否有外部线程请求复位当前线程
         ResetIfRequested();
 
+        // 查看外部线程是否有终止当前线程的请求,如果有的话就跳出这个线程的主函数的主循环
         if(CheckFinish()){
             // cout << "LC: Finish requested" << endl;
             break;
@@ -247,13 +253,19 @@ void LoopClosing::Run()
     SetFinish();
 }
 
+// 将某个关键帧加入到回环检测的过程中,由局部建图线程调用
 void LoopClosing::InsertKeyFrame(KeyFrame *pKF)
 {
     unique_lock<mutex> lock(mMutexLoopQueue);
+    // 注意：这里第0个关键帧不能够参与到回环检测的过程中,因为第0关键帧定义了整个地图的世界坐标系
     if(pKF->mnId!=0)
         mlpLoopKeyFrameQueue.push_back(pKF);
 }
 
+/*
+ * 查看列表中是否有等待被插入的关键帧
+ * @return 如果存在，返回true
+ */
 bool LoopClosing::CheckNewKeyFrames()
 {
     unique_lock<mutex> lock(mMutexLoopQueue);
@@ -263,10 +275,14 @@ bool LoopClosing::CheckNewKeyFrames()
 bool LoopClosing::NewDetectCommonRegions()
 {
     {
+        // Step 1 从队列中取出一个关键帧,作为当前检测闭环关键帧
         unique_lock<mutex> lock(mMutexLoopQueue);
+        // 从队列头开始取，也就是先取早进来的关键帧
         mpCurrentKF = mlpLoopKeyFrameQueue.front();
+        // 取出关键帧后从队列里弹出该关键帧
         mlpLoopKeyFrameQueue.pop_front();
         // Avoid that a keyframe can be erased while it is being process by this thread
+        // 设置当前关键帧不要在优化的过程中被删除
         mpCurrentKF->SetNotErase();
         mpCurrentKF->mbCurrentPlaceRecognition = true;
 
@@ -1016,6 +1032,8 @@ void LoopClosing::CorrectLoop()
 
     // Send a stop signal to Local Mapping
     // Avoid new keyframes are inserted while correcting the loop
+    // Step 0：结束局部地图线程、全局BA，为闭环矫正做准备
+    // 请求局部地图停止，防止在回环矫正时局部地图线程中InsertKeyFrame函数插入新的关键帧
     mpLocalMapper->RequestStop();
     mpLocalMapper->EmptyQueue(); // Proccess keyframes in the queue
 
@@ -1024,9 +1042,10 @@ void LoopClosing::CorrectLoop()
     cout << "Request GBA abort" << endl;
     if(isRunningGBA())
     {
+        // 如果有全局BA在运行，终止掉，迎接新的全局BA
         unique_lock<mutex> lock(mMutexGBA);
         mbStopGBA = true;
-
+        // 记录全局BA次数
         mnFullBAIdx++;
 
         if(mpThreadGBA)
@@ -1038,47 +1057,67 @@ void LoopClosing::CorrectLoop()
     }
 
     // Wait until Local Mapping has effectively stopped
+    // 一直等到局部地图线程结束再继续
     while(!mpLocalMapper->isStopped())
     {
         usleep(1000);
     }
 
     // Ensure current keyframe is updated
+	// Step 1：根据共视关系更新当前关键帧与其它关键帧之间的连接关系
+    // 因为之前闭环检测、计算Sim3中改变了该关键帧的地图点，所以需要更新
     cout << "start updating connections" << endl;
     assert(mpCurrentKF->GetMap()->CheckEssentialGraph());
     mpCurrentKF->UpdateConnections();
     assert(mpCurrentKF->GetMap()->CheckEssentialGraph());
 
     // Retrive keyframes connected to the current keyframe and compute corrected Sim3 pose by propagation
+    // Step 2：通过位姿传播，得到Sim3优化后，与当前帧相连的关键帧的位姿，以及它们的地图点
+    // 当前帧与世界坐标系之间的Sim变换在ComputeSim3函数中已经确定并优化，
+    // 通过相对位姿关系，可以确定这些相连的关键帧与世界坐标系之间的Sim3变换
+
+    // 取出当前关键帧及其共视关键帧，称为“当前关键帧组”
     mvpCurrentConnectedKFs = mpCurrentKF->GetVectorCovisibleKeyFrames();
     mvpCurrentConnectedKFs.push_back(mpCurrentKF);
 
+    // CorrectedSim3：存放闭环g2o优化后当前关键帧的共视关键帧的世界坐标系下Sim3 变换
+    // NonCorrectedSim3：存放没有矫正的当前关键帧的共视关键帧的世界坐标系下Sim3 变换
     KeyFrameAndPose CorrectedSim3, NonCorrectedSim3;
+    // 先将mpCurrentKF的Sim3变换存入，认为是准的，所以固定不动
     CorrectedSim3[mpCurrentKF]=mg2oLoopScw;
+    // 当前关键帧到世界坐标系下的变换矩阵
     cv::Mat Twc = mpCurrentKF->GetPoseInverse();
 
     Map* pLoopMap = mpCurrentKF->GetMap();
-
+    // 对地图点操作
     {
         // Get Map Mutex
+        // 锁定地图点
         unique_lock<mutex> lock(pLoopMap->mMutexMapUpdate);
 
         const bool bImuInit = pLoopMap->isImuInitialized();
-
+        // Step 2.1：通过mg2oLoopScw（认为是准的）来进行位姿传播，得到当前关键帧的共视关键帧的世界坐标系下Sim3 位姿（还没有修正）
+        // 遍历"当前关键帧组""
         for(vector<KeyFrame*>::iterator vit=mvpCurrentConnectedKFs.begin(), vend=mvpCurrentConnectedKFs.end(); vit!=vend; vit++)
         {
             KeyFrame* pKFi = *vit;
 
             cv::Mat Tiw = pKFi->GetPose();
 
-            if(pKFi!=mpCurrentKF)
+            if(pKFi!=mpCurrentKF)      //跳过当前关键帧，因为当前关键帧的位姿已经在前面优化过了，在这里是参考基准
             {
+                // 得到当前关键帧 mpCurrentKF 到其共视关键帧 pKFi 的相对变换
                 cv::Mat Tic = Tiw*Twc;
                 cv::Mat Ric = Tic.rowRange(0,3).colRange(0,3);
                 cv::Mat tic = Tic.rowRange(0,3).col(3);
+
+                // g2oSic：当前关键帧 mpCurrentKF 到其共视关键帧 pKFi 的Sim3 相对变换
+                // 这里是non-correct, 所以scale=1.0
                 g2o::Sim3 g2oSic(Converter::toMatrix3d(Ric),Converter::toVector3d(tic),1.0);
+                // 当前帧的位姿固定不动，其它的关键帧根据相对关系得到Sim3调整的位姿
                 g2o::Sim3 g2oCorrectedSiw = g2oSic*mg2oLoopScw;
                 //Pose corrected with the Sim3 of the loop closure
+                // 存放闭环g2o优化后当前关键帧的共视关键帧的Sim3 位姿
                 CorrectedSim3[pKFi]=g2oCorrectedSiw;
             }
 
@@ -1092,6 +1131,8 @@ void LoopClosing::CorrectLoop()
         // Correct all MapPoints obsrved by current keyframe and neighbors, so that they align with the other side of the loop
         cout << "LC: start correcting KeyFrames" << endl;
         cout << "LC: there are " << CorrectedSim3.size() << " KFs in the local window" << endl;
+		// Step 2.2：得到矫正的当前关键帧的共视关键帧位姿后，修正这些关键帧的地图点
+        // 遍历待矫正的共视关键帧（不包括当前关键帧）
         for(KeyFrameAndPose::iterator mit=CorrectedSim3.begin(), mend=CorrectedSim3.end(); mit!=mend; mit++)
         {
             KeyFrame* pKFi = mit->first;
@@ -1101,6 +1142,7 @@ void LoopClosing::CorrectLoop()
             g2o::Sim3 g2oSiw =NonCorrectedSim3[pKFi];
 
             vector<MapPoint*> vpMPsi = pKFi->GetMapPointMatches();
+            // 遍历待矫正共视关键帧中的每一个地图点
             for(size_t iMP=0, endMPi = vpMPsi.size(); iMP<endMPi; iMP++)
             {
                 MapPoint* pMPi = vpMPsi[iMP];
@@ -1108,31 +1150,42 @@ void LoopClosing::CorrectLoop()
                     continue;
                 if(pMPi->isBad())
                     continue;
-                if(pMPi->mnCorrectedByKF==mpCurrentKF->mnId)
+                if(pMPi->mnCorrectedByKF==mpCurrentKF->mnId) // 标记，防止重复矫正
                     continue;
 
+                // 矫正过程本质上也是基于当前关键帧的优化后的位姿展开的
                 // Project with non-corrected pose and project back with corrected pose
+                // 将该未校正的eigP3Dw先从世界坐标系映射到未校正的pKFi相机坐标系，然后再反映射到校正后的世界坐标系下
                 cv::Mat P3Dw = pMPi->GetWorldPos();
+                // 地图点世界坐标系下坐标
                 Eigen::Matrix<double,3,1> eigP3Dw = Converter::toVector3d(P3Dw);
+                // map(P) 内部做了变换 R*P +t  
+                // 下面变换是：eigP3Dw： world →g2oSiw→ i →g2oCorrectedSwi→ world
                 Eigen::Matrix<double,3,1> eigCorrectedP3Dw = g2oCorrectedSwi.map(g2oSiw.map(eigP3Dw));
 
                 cv::Mat cvCorrectedP3Dw = Converter::toCvMat(eigCorrectedP3Dw);
                 pMPi->SetWorldPos(cvCorrectedP3Dw);
+                // 记录矫正该地图点的关键帧id，防止重复
                 pMPi->mnCorrectedByKF = mpCurrentKF->mnId;
+                // 记录该地图点所在的关键帧id
                 pMPi->mnCorrectedReference = pKFi->mnId;
+                // 因为地图点更新了，需要更新其平均观测方向以及观测距离范围
                 pMPi->UpdateNormalAndDepth();
             }
 
             // Update keyframe pose with corrected Sim3. First transform Sim3 to SE3 (scale translation)
+            // Step 2.3：将共视关键帧的Sim3转换为SE3，根据更新的Sim3，更新关键帧的位姿
+            // 其实是现在已经有了更新后的关键帧组中关键帧的位姿,但是在上面的操作时只是暂时存储到了 KeyFrameAndPose 类型的变量中,还没有写回到关键帧对象中
+            // 调用toRotationMatrix 可以自动归一化旋转矩阵
             Eigen::Matrix3d eigR = g2oCorrectedSiw.rotation().toRotationMatrix();
             Eigen::Vector3d eigt = g2oCorrectedSiw.translation();
             double s = g2oCorrectedSiw.scale();
             // cout << "scale for loop-closing: " << s << endl;
-
+            // 平移向量中包含有尺度信息，还需要用尺度归一化
             eigt *=(1./s); //[R t/s;0 1]
 
             cv::Mat correctedTiw = Converter::toCvSE3(eigR,eigt);
-
+            // 设置矫正后的新的pose
             pKFi->SetPose(correctedTiw);
 
             // Correct velocity according to orientation correction
@@ -1143,6 +1196,8 @@ void LoopClosing::CorrectLoop()
             }
 
             // Make sure connections are updated
+            // Step 2.4：根据共视关系更新当前帧与其它关键帧之间的连接
+            // 地图点的位置改变了,可能会引起共视关系\权值的改变 
             pKFi->UpdateConnections();
         }
         // TODO Check this index increasement
@@ -1153,16 +1208,24 @@ void LoopClosing::CorrectLoop()
         // Start Loop Fusion
         // Update matched map points and replace if duplicated
         cout << "LC: start replacing duplicated" << endl;
+        // Step 3：检查当前帧的地图点与经过闭环匹配后该帧的地图点是否存在冲突，对冲突的进行替换或填补
+        // mvpCurrentMatchedPoints 是当前关键帧和闭环关键帧组的所有地图点进行投影得到的匹配点
         for(size_t i=0; i<mvpLoopMatchedMPs.size(); i++)
         {
             if(mvpLoopMatchedMPs[i])
             {
+                //取出同一个索引对应的两种地图点，决定是否要替换
+                // 匹配投影得到的地图点
                 MapPoint* pLoopMP = mvpLoopMatchedMPs[i];
+                // 原来的地图点
                 MapPoint* pCurMP = mpCurrentKF->GetMapPoint(i);
                 if(pCurMP)
+                    // 如果有重复的MapPoint，则用匹配的地图点代替现有的
+                    // 因为匹配的地图点是经过一系列操作后比较精确的，现有的地图点很可能有累计误差
                     pCurMP->Replace(pLoopMP);
                 else
                 {
+                    // 如果当前帧没有该MapPoint，则直接添加
                     mpCurrentKF->AddMapPoint(pLoopMP,i);
                     pLoopMP->AddObservation(mpCurrentKF,i);
                     pLoopMP->ComputeDistinctiveDescriptors();
@@ -1175,27 +1238,37 @@ void LoopClosing::CorrectLoop()
     // Project MapPoints observed in the neighborhood of the loop keyframe
     // into the current keyframe and neighbors using corrected poses.
     // Fuse duplications.
-    //cout << "LC: start SearchAndFuse" << endl;
+    // Step 4：将闭环相连关键帧组mvpLoopMapPoints 投影到当前关键帧组中，进行匹配，融合，新增或替换当前关键帧组中KF的地图点
+    // 因为 闭环相连关键帧组mvpLoopMapPoints 在地图中时间比较久经历了多次优化，认为是准确的
+    // 而当前关键帧组中的关键帧的地图点是最近新计算的，可能有累积误差
+    // CorrectedSim3：存放矫正后当前关键帧的共视关键帧，及其世界坐标系下Sim3 变换
     SearchAndFuse(CorrectedSim3, mvpLoopMapPoints);
     //cout << "LC: end SearchAndFuse" << endl;
 
 
     // After the MapPoint fusion, new links in the covisibility graph will appear attaching both sides of the loop
-    //cout << "LC: start updating covisibility graph" << endl;
+    // Step 5：更新当前关键帧之间的共视相连关系，得到因闭环时MapPoints融合而新得到的连接关系
+    // LoopConnections：存储因为闭环地图点调整而新生成的连接关系
     map<KeyFrame*, set<KeyFrame*> > LoopConnections;
 
+    // Step 5.1：遍历当前帧相连关键帧组（一级相连）
     for(vector<KeyFrame*>::iterator vit=mvpCurrentConnectedKFs.begin(), vend=mvpCurrentConnectedKFs.end(); vit!=vend; vit++)
     {
         KeyFrame* pKFi = *vit;
+        // Step 5.2：得到与当前帧相连关键帧的相连关键帧（二级相连）
         vector<KeyFrame*> vpPreviousNeighbors = pKFi->GetVectorCovisibleKeyFrames();
 
         // Update connections. Detect new links.
+        // Step 5.3：更新一级相连关键帧的连接关系(会把当前关键帧添加进去,因为地图点已经更新和替换了)
         pKFi->UpdateConnections();
+        // Step 5.4：取出该帧更新后的连接关系
         LoopConnections[pKFi]=pKFi->GetConnectedKeyFrames();
+        // Step 5.5：从连接关系中去除闭环之前的二级连接关系，剩下的连接就是由闭环得到的连接关系
         for(vector<KeyFrame*>::iterator vit_prev=vpPreviousNeighbors.begin(), vend_prev=vpPreviousNeighbors.end(); vit_prev!=vend_prev; vit_prev++)
         {
             LoopConnections[pKFi].erase(*vit_prev);
         }
+        // Step 5.6：从连接关系中去除闭环之前的一级连接关系，剩下的连接就是由闭环得到的连接关系
         for(vector<KeyFrame*>::iterator vit2=mvpCurrentConnectedKFs.begin(), vend2=mvpCurrentConnectedKFs.end(); vit2!=vend2; vit2++)
         {
             LoopConnections[pKFi].erase(*vit2);
@@ -1220,6 +1293,7 @@ void LoopClosing::CorrectLoop()
     else
     {
         //cout << "With 7DoF" << endl;
+		// Step 6：进行EssentialGraph优化，LoopConnections是形成闭环后新生成的连接关系，不包括步骤7中当前帧与闭环匹配帧之间的连接关系
         Optimizer::OptimizeEssentialGraph(pLoopMap, mpLoopMatchedKF, mpCurrentKF, NonCorrectedSim3, CorrectedSim3, LoopConnections, bFixedScale);
     }
 
@@ -1230,12 +1304,17 @@ void LoopClosing::CorrectLoop()
     mpAtlas->InformNewBigChange();
 
     // Add loop edge
+    // Step 7：添加当前帧与闭环匹配帧之间的边（这个连接关系不优化）
+    // !这两句话应该放在OptimizeEssentialGraph之前，因为OptimizeEssentialGraph的步骤4.2中有优化
     mpLoopMatchedKF->AddLoopEdge(mpCurrentKF);
     mpCurrentKF->AddLoopEdge(mpLoopMatchedKF);
 
     // Launch a new thread to perform Global Bundle Adjustment (Only if few keyframes, if not it would take too much time)
     if(!pLoopMap->isImuInitialized() || (pLoopMap->KeyFramesInMap()<200 && mpAtlas->CountMaps()==1))
     {
+	    // Step 8：新建一个线程用于全局BA优化
+    	// OptimizeEssentialGraph只是优化了一些主要关键帧的位姿，这里进行全局BA可以全局优化所有位姿和MapPoints
+
         mbRunningGBA = true;
         mbFinishedGBA = false;
         mbStopGBA = false;
@@ -2357,7 +2436,7 @@ void LoopClosing::SearchAndFuse(const vector<KeyFrame*> &vConectedKFs, vector<Ma
     cout << "FUSE-POSE: " << total_replaces << " MPs had been fused" << endl;
 }
 
-
+// 由外部线程调用,请求复位当前线程
 
 void LoopClosing::RequestReset()
 {
@@ -2395,16 +2474,17 @@ void LoopClosing::RequestResetActiveMap(Map *pMap)
         usleep(3000);
     }
 }
-
+// 当前线程调用,检查是否有外部线程请求复位当前线程,如果有的话就复位回环检测线程
 void LoopClosing::ResetIfRequested()
 {
     unique_lock<mutex> lock(mMutexReset);
+    // 如果有来自于外部的线程的复位请求,那么就复位当前线程
     if(mbResetRequested)
     {
         cout << "Loop closer reset requested..." << endl;
-        mlpLoopKeyFrameQueue.clear();
-        mLastLoopKFid=0;  //TODO old variable, it is not use in the new algorithm
-        mbResetRequested=false;
+        mlpLoopKeyFrameQueue.clear();   // 清空参与和进行回环检测的关键帧队列
+        mLastLoopKFid=0;                // 上一次没有和任何关键帧形成闭环关系
+        mbResetRequested=false;         // 复位请求标志复位
         mbResetActiveMapRequested = false;
     }
     else if(mbResetActiveMapRequested)
@@ -2437,7 +2517,7 @@ void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoop
         Optimizer::GlobalBundleAdjustemnt(pActiveMap,10,&mbStopGBA,nLoopKF,false);
     else
         Optimizer::FullInertialBA(pActiveMap,7,false,nLoopKF,&mbStopGBA);
-
+    // 记录GBA已经迭代次数,用来检查全局BA过程是否是因为意外结束的
 
     int idx =  mnFullBAIdx;
     // Optimizer::GlobalBundleAdjustemnt(mpMap,10,&mbStopGBA,nLoopKF,false);
@@ -2595,6 +2675,7 @@ void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoop
             // Correct MapPoints
             const vector<MapPoint*> vpMPs = pActiveMap->GetAllMapPoints();
 
+            // 遍历每一个地图点
             for(size_t i=0; i<vpMPs.size(); i++)
             {
                 MapPoint* pMP = vpMPs[i];
@@ -2602,16 +2683,20 @@ void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoop
                 if(pMP->isBad())
                     continue;
 
+                // NOTICE 并不是所有的地图点都会直接参与到全局BA优化中,但是大部分的地图点需要根据全局BA优化后的结果来重新纠正自己的位姿
+                // 如果这个地图点直接参与到了全局BA优化的过程,那么就直接重新设置器位姿即可
                 if(pMP->mnBAGlobalForKF==nLoopKF)
                 {
                     // If optimized by Global BA, just update
                     pMP->SetWorldPos(pMP->mPosGBA);
                 }
-                else
+                else // 如故这个地图点并没有直接参与到全局BA优化的过程中,那么就使用器参考关键帧的新位姿来优化自己的位姿
                 {
                     // Update according to the correction of its reference keyframe
                     KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
 
+                    // 说明这个关键帧，在前面的过程中也没有因为“当前关键帧”得到全局BA优化 
+                    //? 可是,为什么会出现这种情况呢? 难道是因为这个地图点的参考关键帧设置成为了bad?
                     if(pRefKF->mnBAGlobalForKF!=nLoopKF)
                         continue;
 
@@ -2621,9 +2706,11 @@ void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoop
                     // Map to non-corrected camera
                     cv::Mat Rcw = pRefKF->mTcwBefGBA.rowRange(0,3).colRange(0,3);
                     cv::Mat tcw = pRefKF->mTcwBefGBA.rowRange(0,3).col(3);
+                    // 转换到其参考关键帧相机坐标系下的坐标
                     cv::Mat Xc = Rcw*pMP->GetWorldPos()+tcw;
 
                     // Backproject using corrected camera
+                    // 然后使用已经纠正过的参考关键帧的位姿,再将该地图点变换到世界坐标系下
                     cv::Mat Twc = pRefKF->GetPoseInverse();
                     cv::Mat Rwc = Twc.rowRange(0,3).colRange(0,3);
                     cv::Mat twc = Twc.rowRange(0,3).col(3);
@@ -2648,6 +2735,7 @@ void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoop
     }
 }
 
+// 由外部线程调用,请求终止当前线程
 void LoopClosing::RequestFinish()
 {
     unique_lock<mutex> lock(mMutexFinish);
@@ -2655,18 +2743,21 @@ void LoopClosing::RequestFinish()
     mbFinishRequested = true;
 }
 
+// 当前线程调用,查看是否有外部线程请求当前线程
 bool LoopClosing::CheckFinish()
 {
     unique_lock<mutex> lock(mMutexFinish);
     return mbFinishRequested;
 }
 
+// 有当前线程调用,执行完成该函数之后线程主函数退出,线程销毁
 void LoopClosing::SetFinish()
 {
     unique_lock<mutex> lock(mMutexFinish);
     mbFinished = true;
 }
 
+// 由外部线程调用,判断当前回环检测线程是否已经正确终止了
 bool LoopClosing::isFinished()
 {
     unique_lock<mutex> lock(mMutexFinish);

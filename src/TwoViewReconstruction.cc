@@ -117,7 +117,7 @@ bool TwoViewReconstruction::Reconstruct(const std::vector<cv::KeyPoint>& vKeys1,
     if(RH>0.50) // if(RH>0.40)
     {
         //cout << "Initialization from Homography" << endl;
-        return ReconstructH(vbMatchesInliersH,H, mK,R21,t21,vP3D,vbTriangulated,minParallax,50);
+        return ReconstructH(vbMatchesInliersH,H,mK,R21,t21,vP3D,vbTriangulated,minParallax,50);
     }
     else //if(pF_HF>0.6)
     {

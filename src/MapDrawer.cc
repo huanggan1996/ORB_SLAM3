@@ -122,7 +122,9 @@ bool MapDrawer::ParseViewerParamFile(cv::FileStorage &fSettings)
 
 void MapDrawer::DrawMapPoints()
 {
+    //取出所有的地图点
     const vector<MapPoint*> &vpMPs = mpAtlas->GetAllMapPoints();
+    //取出mvpReferenceMapPoints，也即局部地图d点
     const vector<MapPoint*> &vpRefMPs = mpAtlas->GetReferenceMapPoints();
 
     set<MapPoint*> spRefMPs(vpRefMPs.begin(), vpRefMPs.end());
